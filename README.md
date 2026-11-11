@@ -1,3 +1,11 @@
+> [!WARNING]
+> **This is n64hub/THPS64Host-web, a fork, not THPS64Host.** Its `main` branch adds web support: the host built into a
+> web page (WebGPU, through [N64Recomp-browser](https://github.com/n64hub/N64Recomp-browser)) by `host/tools/build_web.py`
+> and `host/cmake/thps_host.cmake`'s Emscripten parts, every source change behind `__EMSCRIPTEN__`. Everything on that
+> branch past upstream's commits was written by AI (Claude). It is not made, endorsed or supported by THPS64Recomp:
+> nothing here is offered upstream, and please don't take issues with this fork to them. The page it builds is
+> [THPS2-64Recomp-web](https://github.com/n64hub/THPS2-64Recomp-web)'s.
+
 # THPS64Host
 
 The shared host of the THPS64Recomp ports:
