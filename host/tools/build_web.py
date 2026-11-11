@@ -37,14 +37,29 @@ COMMON = hostenv.COMMON
 SHARED = hostenv.SHARED
 TOOLS = hostenv.TOOLS
 
-# <N64Recomp-browser project> <its checkout in the runtime> [files whose web change this host makes its own way]
+# <N64Recomp-browser project> <its checkout in the runtime>
 WEB_PATCHES = [
-    ("rt64", "lib/rt64", []),
-    ("plume", "lib/rt64/src/contrib/plume", []),
-    ("hlslpp", "lib/rt64/src/contrib/hlslpp", []),
-    ("N64ModernRuntime", "lib/N64ModernRuntime", []),
-    ("N64Recomp", "lib/N64ModernRuntime/N64Recomp", []),
+    ("rt64", "lib/rt64"),
+    ("plume", "lib/rt64/src/contrib/plume"),
+    ("hlslpp", "lib/rt64/src/contrib/hlslpp"),
+    ("N64ModernRuntime", "lib/N64ModernRuntime"),
+    ("N64Recomp", "lib/N64ModernRuntime/N64Recomp"),
 ]
+# The files where this host's patches and the web's change the same lines, the web's change to them merged by hand
+# into web/patches/<project>.patch from the N64Recomp-browser commit files.txt names (its header says why each).
+WEB_MERGED = os.path.join(SHARED, "web", "patches")
+
+
+def merged_files():
+    """{project: [files]} and the N64Recomp-browser commit they were merged from, read from web/patches/files.txt."""
+    files, since = {}, None
+    for line in open(os.path.join(WEB_MERGED, "files.txt")):
+        if line.startswith("# merged from N64Recomp-browser "):
+            since = line.split()[-1]
+        elif line.strip() and not line.startswith("#"):
+            name, path = line.split()[:2]
+            files.setdefault(name, []).append(path)
+    return files, since
 
 
 def say(msg):
@@ -84,7 +99,7 @@ def step_runtime(work, browser):
     runtime = os.path.join(work, "runtime")
     head = subprocess.run(["git", "-C", browser, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     stamp = head + " " + hash_files([os.path.join(SHARED, "patches"), os.path.join(TOOLS, "setup_runtime.py"),
-                                     os.path.join(browser, "patches")]) + " " + repr(WEB_PATCHES)
+                                     os.path.join(browser, "patches"), WEB_MERGED]) + " " + repr(WEB_PATCHES)
     stamp_file = os.path.join(work, "runtime.stamp")
     if read(stamp_file) == stamp and os.path.isdir(runtime):
         print("up to date")
@@ -94,8 +109,14 @@ def step_runtime(work, browser):
     hostenv.rmtree(runtime)
     run([sys.executable, "-I", os.path.join(TOOLS, "setup_runtime.py"), runtime])
     apply = os.path.join(browser, "patches", "apply.cmake")
-    for name, checkout, own in WEB_PATCHES:
-        run(["cmake", "-P", apply, name, os.path.join(runtime, checkout), *own])
+    merged, since = merged_files()
+    for name, checkout in WEB_PATCHES:
+        path = os.path.join(runtime, checkout)
+        own = merged.get(name, [])
+        run(["cmake", "-P", apply, name, path, *own])
+        if own:
+            run(["git", "-C", path, "apply", "--whitespace=nowarn", os.path.join(WEB_MERGED, f"{name}.patch")])
+            run(["cmake", "-P", apply, name, path, "--since", since, *own])
     open(stamp_file, "w").write(stamp)
     return runtime
 

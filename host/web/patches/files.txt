@@ -1,0 +1,17 @@
+# The files where this host's own runtime patches (host/patches, tools/setup_runtime.py) change the same lines as
+# N64Recomp-browser's web support: <project> <path in the project>. tools/build_web.py leaves each out of
+# N64Recomp-browser's patch for its project and applies web/patches/<project>.patch in its place, the web's change to
+# these files merged by hand on top of this host's. The web's later changes to them are merged in by apply.cmake --since
+# from the commit below; one that meets this host's own lines stops the build, for another merge by hand and this
+# commit moved.
+#
+# rt64: rt64-present-capture-widescreen adds the test harness's present capture where the web adds its present pacing
+# (the includes, and whether a present draws: the swap chain on, and the draw's timer). In rt64_rsp.cpp
+# rt64-viewport-behind-camera and the web both mend the box of a triangle with a corner behind the camera: this host's
+# takes it as covering the scissor, the web's (rt64 a8bfc93, dd2fd23) as covering the scissor if it crosses the camera
+# plane and as drawing nothing if it is wholly behind it. The page keeps the web's, which covers this host's case, and
+# the web's mergeScissor.
+# merged from N64Recomp-browser 73144095de33975c9973083c536c215cb252a5e0
+rt64 src/hle/rt64_present_queue.cpp
+rt64 src/hle/rt64_present_queue.h
+rt64 src/hle/rt64_rsp.cpp

@@ -1,0 +1,687 @@
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index a13461f..df933e1 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -7,6 +7,10 @@
+ #include "common/rt64_thread.h"
+ #include "rhi/rt64_render_hooks.h"
+ 
++#if defined(__EMSCRIPTEN__)
++#   include <emscripten.h>
++#endif
++
+ #include "rt64_workload_queue.h"
+ 
+ namespace RT64 {
+@@ -36,6 +40,12 @@ namespace RT64 {
+     }
+ 
+     void PresentQueue::advanceToNextPresent() {
++        // For present-stats, when the present was queued: before the stall below, which waits only while the present
++        // thread is the whole queue behind.
++        if (presentStats) {
++            presentQueued[writeCursor] = Timer::current();
++        }
++
+         int nextWriteCursor = (writeCursor + 1) % presents.size();
+ 
+         // Stall the thread until the barrier is lifted if we're trying to write on a present being used by the GPU.
+@@ -88,6 +98,15 @@ namespace RT64 {
+ 
+         viRenderer = std::make_unique<VIRenderer>();
+ 
++#   if defined(__EMSCRIPTEN__)
++        // A page opened with ?uncapped measures how many presents a second it can make: plume reports the display's rate
++        // as the query's (360), the frames are interpolated to it, and none are paced (pace()), so that what the GPU
++        // and the browser can take is what is presented. The interpolated frames take turns in 8 color targets of the
++        // game's framebuffer at the output's scale (WorkloadQueue's InterpolatedTargetSlots), 0.25-0.55 GB at 3840x2000.
++        uncapped = MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('uncapped') ? 1 : 0; }) != 0;
++        presentStats = MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('present-stats') ? 1 : 0; }) != 0;
++#   endif
++
+         presentThreadRunning = true;
+         presentThread = new std::thread(&PresentQueue::threadLoop, this);
+     }
+@@ -114,10 +133,25 @@ namespace RT64 {
+             targetRate = ext.sharedResources->targetRate;
+         }
+ 
++        // Presents are paced to a lower rate while the GPU can't keep up (pace()).
++        const uint32_t pacedRate = ext.sharedResources->pacedRate;
++        if ((pacedRate > 0) && (pacedRate < targetRate)) {
++            targetRate = pacedRate;
++        }
++
+         RenderTarget *colorTarget = nullptr;
+         int32_t framesToPresent = 1;
+         bool lockedWorkloadMutex = false;
++#   if RT64_GAME_FRAME_WORKLOADS
++        // The counters are taken under the lock the workload thread switches them under, and held until this present ends
++        // (InterpolatedFrameCounters::inUse).
++        ext.sharedResources->interpolatedMutex.lock();
++#   endif
+         InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
++#   if RT64_GAME_FRAME_WORKLOADS
++        frameCounters.inUse = true;
++        ext.sharedResources->interpolatedMutex.unlock();
++#   endif
+ 
+         // TODO: There's a possible race condition interactions that can happen while the workload
+         // queue is rendering extra frames and the present event is processed while it's generating
+@@ -272,6 +306,7 @@ namespace RT64 {
+             if ((framesToPresent > 1) && (usingMSAA || (i > 0))) {
+                 // Stall until the interpolated color target is available.
+                 const uint32_t targetIndex = usingMSAA ? i : (i - 1);
++                PhaseTimer phaseTimer(this, PhaseInterpolated);
+                 std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+                 ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
+                     return (frameCounters.available > targetIndex) || ((frameCounters.available == targetIndex) && frameCounters.skipped);
+@@ -288,7 +323,8 @@ namespace RT64 {
+ 
+                 if (i < framesToPresent) {
+                     uint32_t targetIndex = usingMSAA ? i : (i - 1);
+-                    colorTarget = ext.sharedResources->interpolatedColorTargets[targetIndex].get();
++                    const auto &interpolatedTargets = ext.sharedResources->interpolatedColorTargets;
++                    colorTarget = interpolatedTargets[targetIndex % interpolatedTargets.size()].get();
+                 }
+                 else {
+                     colorTarget = nullptr;
+@@ -321,7 +357,9 @@ namespace RT64 {
+ 
+             uint32_t swapChainIndex = 0;
+             const bool presentFrame = (i < framesToPresent) && swapChainValid && swapChainEnabled;
++            std::optional<PhaseTimer> drawTimer;
+             if (presentFrame) {
++                drawTimer.emplace(this, PhaseDraw);
+                 swapChainValid = ext.swapChain->acquireTexture(acquiredSemaphore.get(), &swapChainIndex);
+             }
+ 
+@@ -391,6 +429,7 @@ namespace RT64 {
+                 }
+             }
+ 
++            drawTimer.reset();
+             if (lockedWorkloadMutex) {
+                 ext.sharedResources->workloadMutex.unlock();
+                 lockedWorkloadMutex = false;
+@@ -413,20 +452,68 @@ namespace RT64 {
+             if (presentFrame && swapChainValid) {
+                 // Wait until the approximate time the next present should be at the current intended rate.
+                 if ((presentTimestamp != Timestamp()) && (targetRate > 0) && (targetRate > viOriginalRate)) {
++#               if defined(__EMSCRIPTEN__)
++                    // On a fixed timeline: each present's slot is one period after the last one's, not after the moment
++                    // it went out, so the time spent past a slot (the sleep waking on the browser's timer, wait()'s trip
++                    // to the page's thread) isn't added to every period. In Chrome the pages of games below the
++                    // display's rate presented every 18 ms, 55.6 a second, where those at its rate, which never sleep
++                    // here, presented 60. A present a whole period past its slot or more starts the slots from itself.
++                    // Where the swap chain learns of the display's frames as they come (WebGPU), it sleeps: until a
++                    // frame where timed waits end late, else until the slot, woken by the frames and spun from the last
++                    // (plume-web e16e003: this thread's 100 us sleeps in Chrome now and then took a tick).
++                    const auto presentPeriod = std::chrono::nanoseconds(1'000'000'000 / targetRate);
++                    if ((presentSlot == Timestamp()) || ((presentTimestamp - presentSlot) >= presentPeriod)) {
++                        presentSlot = presentTimestamp;
++                    }
++
++                    presentSlot += presentPeriod;
++                    const bool slotAhead = presentStats && (presentSlot > Timer::current());
++                    {
++                        PhaseTimer phaseTimer(this, PhaseSleep);
++                        if (!ext.swapChain->sleepUntil(std::chrono::steady_clock::now() + (presentSlot - Timer::current()))) {
++                            Timer::preciseSleepUntil(presentSlot);
++                        }
++                    }
++
++                    // Only a sleep that had a slot to wait for woke past it: one already past (after a stall) didn't sleep.
++                    if (slotAhead) {
++                        busyLateMicro += std::max(Timer::deltaMicroseconds(presentSlot, Timer::current()), int64_t(0));
++                    }
++#               else
+                     Timer::preciseSleepUntil(presentTimestamp + std::chrono::nanoseconds(1'000'000'000 / targetRate));
++#               endif
++                }
++#           if defined(__EMSCRIPTEN__)
++                else {
++                    presentSlot = Timestamp();
+                 }
++#           endif
+ 
+                 if (presentWaitEnabled) {
++                    PhaseTimer phaseTimer(this, PhaseWait);
+                     ext.swapChain->wait();
+                 }
+ 
+                 RenderCommandSemaphore *waitSemaphore = drawSemaphores[swapChainIndex].get();
++#           if defined(__EMSCRIPTEN__)
++                pacingShown++;
++#           endif
+                 presentTimestamp = Timer::current();
++                PhaseTimer phaseTimer(this, PhasePresent);
+                 swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
+                 windowPresentCount++;
+                 presentProfiler.logAndRestart();
+             }
+         }
++
++#   if RT64_GAME_FRAME_WORKLOADS
++        {
++            std::scoped_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
++            frameCounters.inUse = false;
++        }
++
++        ext.sharedResources->interpolatedCondition.notify_all();
++#   endif
+     }
+ 
+     void PresentQueue::threadCapture(RenderTarget *colorTarget, const Present &present, UserConfiguration::Filtering filtering, bool removeBlackBorders, uint64_t presentIndex, bool shownInWindow, bool readback, bool drawUi) {
+@@ -539,6 +626,205 @@ namespace RT64 {
+         ext.sharedResources->interpolatedCondition.notify_all();
+     }
+ 
++    // Frames interpolated to the display's rate are drawn for evenly spaced moments, so motion looks even only if each
++    // is presented. When the GPU can't keep up, a game frame whose present is still waiting behind the next one is
++    // dropped whole, and the rest get one, two or three presents: some frames shown three times, some never. That
++    // happens in Chrome and Firefox alike on a laptop's integrated graphics. So while frames are being dropped (one
++    // present in ten or more over 2 s, 4 at least), each game frame gets fewer presents, a number that divides the
++    // display's rate evenly (a 30 fps game on a 60 Hz display: 1, at 30 a second), and a while later it tries the
++    // number above again: after 10 s, twice as long each time it falls straight back (2 min at most). The number is
++    // kept, not the rate, since a game's own rate moves (Banjo-Kazooie's between 20 and 30). A present dropped now and
++    // then is not the GPU falling behind: a pipeline built behind the game (Chrome) drops one every second or two, and
++    // counting those (2 in a second) held GoldenEye's cast credits, 8-12 game frames a second, at one present a frame
++    // for 10-30 s. Nor is a burst of a few: presents stop while the game waits for prebuilt shaders, come through at once
++    // after, and the GPU is busy for a moment with what it was given, so drops are counted over a whole 2 s of presents,
++    // never fewer: judged on the first few dozen after a wait, or after a try of the number above (which starts the count
++    // again), 4 dropped were enough, and Donkey Kong 64 in Firefox went to 30 presents a second right after its boot's
++    // wait and stayed there for 70 s, each try falling straight back. And the count starts again a second after any such
++    // wait ends: a wait shorter than 2 s left presents from before it in the count beside the burst after it, and
++    // Banjo-Kazooie in Chrome went to 30 a second 0.4 s after its 1.5 s wait, for 10 s. A game at about the display's
++    // rate (a launcher's 60 on a 59-61 Hz display) has nothing to be paced to, and its drops while a page loads aren't
++    // counted either. Nor is a page opened with ?uncapped paced, which drops presents by design. Nor are presents counted
++    // while the page is hidden, when none is presented (below), or for a second after, as after a wait: a hidden page's
++    // presents dropped while the browser held its present callbacks (plume's isHidden()), and Mario Kart 64's page on a
++    // 240 Hz display went from 114 presents a second to 60 while hidden, each try of the number above falling straight
++    // back and doubling the time to the next, so it stayed at 60 for 80 s after the tab came back. Nor are presents
++    // dropped while the presents before them went out on their slots: the GPU kept up, and presents were only queued
++    // sooner than the slots their game frames were given, which fewer presents a frame shows no more evenly. So drops
++    // count only while fewer than 95% of the presents the window's rate makes went out in it. Dinosaur Planet's page,
++    // in the CloudRunner flight, queued 45 presents a second for 30 game frames, with the GPU 2% busy, and stayed at
++    // one present a game frame (45 a second, 240 at the display's rate) for the last 65 s of a play: at each try of
++    // the number above it dropped a present in ten or more while the present thread slept until every slot.
++    // A page opened with ?present-stats prints where the present thread's time went before each present it drops
++    // (reportDroppedPresent()).
++    void PresentQueue::pace(bool presentDropped) {
++        const uint32_t targetRate = ext.sharedResources->targetRate;
++        const uint32_t originalRate = ext.sharedResources->viOriginalRate;
++        auto setPacedRate = [&](uint32_t pacedRate) {
++            if ((pacedRate == 0) != (ext.sharedResources->pacedRate == 0)) {
++                const char *what = (pacedRate > 0) ? "paced to the game's frames while the GPU falls behind" : "back at the display's rate";
++                printf("RT64: presents %s (the game at %u frames a second)\n", what, originalRate);
++            }
++
++            ext.sharedResources->pacedRate = pacedRate;
++        };
++
++        // Whether a number of presents a game frame is fewer than the display's rate gives it (by more than 5%), and
++        // whether it is spaced evenly on the display: the display's rate a whole multiple of the presents' (within 5%,
++        // for a 59 Hz display), or one a frame.
++        auto isFewer = [&](uint32_t multiple) {
++            return (multiple * originalRate * 20) < (targetRate * 19);
++        };
++
++        if (uncapped || (targetRate == 0) || (originalRate == 0) || !isFewer(1)) {
++            pacingMultiple = 0;
++            pacingPresents.clear();
++            pacingDropped = 0;
++            setPacedRate(0);
++            return;
++        }
++
++        auto isEven = [&](uint32_t multiple) {
++            const uint32_t rate = multiple * originalRate;
++            const uint32_t whole = (targetRate + rate / 2) / rate;
++            return (multiple == 1) || ((whole > 0) && (uint32_t(std::abs(int(targetRate) - int(whole * rate))) * 20 <= targetRate));
++        };
++
++        // The most presents a game frame can get that are fewer and even, at most a number, or one.
++        auto pacedMultipleAtMost = [&](uint32_t multiple) {
++            while ((multiple > 1) && (!isFewer(multiple) || !isEven(multiple))) {
++                multiple--;
++            }
++
++            return std::max(multiple, 1U);
++        };
++
++        const Timestamp now = Timer::current();
++        const int64_t minRetryMicro = 10'000'000;
++        const int64_t maxRetryMicro = 120'000'000;
++        const int64_t fallBackMicro = 3'000'000;
++        if (pacingRetryMicro == 0) {
++            pacingRetryMicro = minRetryMicro;
++            pacingChanged = now;
++        }
++
++        const uint32_t prebuildWaits = ext.sharedResources->prebuildWaits;
++        if (prebuildWaits != pacingPrebuildWaits) {
++            pacingPrebuildWaits = prebuildWaits;
++            pacingWaited = now;
++        }
++
++        if (ext.swapChain->isHidden()) {
++            pacingWaited = now;
++        }
++
++        if ((pacingWaited != Timestamp()) && (Timer::deltaMicroseconds(pacingWaited, now) < 1'000'000)) {
++            pacingPresents.clear();
++            pacingDropped = 0;
++            return;
++        }
++
++        pacingPresents.push_back({ now, presentDropped, pacingShown });
++        pacingDropped += presentDropped ? 1 : 0;
++        while (Timer::deltaMicroseconds(pacingPresents.front().time, now) > 2'000'000) {
++            pacingDropped -= pacingPresents.front().dropped ? 1 : 0;
++            pacingPresents.pop_front();
++        }
++
++        // The rate presents are meant to go out at (present()'s), and whether fewer went out in the window.
++        const int64_t windowMicro = Timer::deltaMicroseconds(pacingPresents.front().time, now);
++        const uint32_t presentRate = (pacingMultiple > 0) ? std::min(pacedMultipleAtMost(pacingMultiple) * originalRate, targetRate) : targetRate;
++        const uint64_t shown = pacingShown - pacingPresents.front().shown;
++        const bool shownBehind = (shown * 1'000'000 * 20) < (uint64_t(presentRate) * uint64_t(windowMicro) * 19);
++        const bool wholeWindow = windowMicro >= 1'900'000;
++        const bool fallingBehind = wholeWindow && shownBehind && (pacingDropped >= 4) && ((pacingDropped * 10) >= pacingPresents.size());
++        const int64_t sinceChange = Timer::deltaMicroseconds(pacingChanged, now);
++        if (fallingBehind && (pacingMultiple != 1)) {
++            pacingMultiple = pacedMultipleAtMost((pacingMultiple > 0) ? (pacingMultiple - 1) : (targetRate / originalRate));
++
++            if ((pacingRaised != Timestamp()) && (Timer::deltaMicroseconds(pacingRaised, now) < fallBackMicro)) {
++                pacingRetryMicro = std::min(pacingRetryMicro * 2, maxRetryMicro);
++            }
++
++            pacingPresents.clear();
++            pacingDropped = 0;
++            pacingChanged = now;
++        }
++        else if ((pacingMultiple > 0) && (sinceChange >= pacingRetryMicro)) {
++            do {
++                pacingMultiple++;
++            } while (isFewer(pacingMultiple) && !isEven(pacingMultiple));
++
++            if (!isFewer(pacingMultiple)) {
++                pacingMultiple = 0;
++            }
++
++            pacingPresents.clear();
++            pacingDropped = 0;
++            pacingChanged = now;
++            pacingRaised = now;
++        }
++        else if ((pacingMultiple == 0) && (sinceChange >= maxRetryMicro)) {
++            pacingRetryMicro = minRetryMicro;
++        }
++
++        // The game's rate may have moved since the number was picked, so it is the even number at most that large.
++        setPacedRate((pacingMultiple > 0) ? (pacedMultipleAtMost(pacingMultiple) * originalRate) : 0);
++    }
++
++    PresentQueue::PhaseTimer::PhaseTimer(PresentQueue *queue, PresentPhase phase) : queue(queue), phase(phase) {
++        if (queue->presentStats) {
++            start = Timer::current();
++        }
++    }
++
++    PresentQueue::PhaseTimer::~PhaseTimer() {
++        if (queue->presentStats) {
++            queue->busyPhaseMicro[phase] += Timer::deltaMicroseconds(start, Timer::current());
++        }
++    }
++
++    void PresentQueue::resetBusyFrames() {
++        busyPhaseMicro.fill(0);
++        busyLateMicro = 0;
++        busyFrames = 0;
++        busyStart = Timer::current();
++    }
++
++    // With present-stats, a line for each present dropped because the next was already queued behind it (what pace()
++    // counts): how long it waited, and where the present thread's time went in the game frames since it last waited for
++    // a present or dropped one, as each frame's share: waiting for its workload, for the next interpolated frame, drawing
++    // and submitting each present, sleeping until each one's slot (and how far past the slots it woke), wait() (for
++    // fewer presents in flight, and the trips to the device thread it makes to ask), the present() calls, and the rest.
++    // The thread fell a game frame behind in those frames, so what grew in them is what dropped the present.
++    void PresentQueue::reportDroppedPresent(int droppedCursor, int nextCursor) {
++        const Timestamp now = Timer::current();
++        const double waitedMs = Timer::deltaMicroseconds(presentQueued[droppedCursor], now) / 1000.0;
++        const double nextMs = Timer::deltaMicroseconds(presentQueued[droppedCursor], presentQueued[nextCursor]) / 1000.0;
++        if (busyFrames == 0) {
++            printf("RT64: present dropped (it waited %.1f ms, the next came %.1f ms after it)\n", waitedMs, nextMs);
++        }
++        else {
++            const double frameMs = Timer::deltaMicroseconds(busyStart, now) / 1000.0 / busyFrames;
++            auto phaseMs = [&](PresentPhase phase) {
++                return busyPhaseMicro[phase] / 1000.0 / busyFrames;
++            };
++
++            double restMs = frameMs;
++            for (uint32_t p = 0; p < PhaseCount; p++) {
++                restMs -= phaseMs(PresentPhase(p));
++            }
++
++            printf("RT64: present dropped (it waited %.1f ms, the next came %.1f ms after it); the %u game frames before it "
++                "since the present thread last waited took %.1f ms each: workload %.1f, interpolated %.1f, draw %.1f, "
++                "sleep %.1f (%.1f past the slots), wait() %.1f, present() %.1f, the rest %.1f\n",
++                waitedMs, nextMs, busyFrames, frameMs, phaseMs(PhaseWorkload), phaseMs(PhaseInterpolated), phaseMs(PhaseDraw),
++                phaseMs(PhaseSleep), busyLateMicro / 1000.0 / busyFrames, phaseMs(PhaseWait), phaseMs(PhasePresent), restMs);
++        }
++
++        resetBusyFrames();
++    }
++
+     void PresentQueue::notifyPresentId(const Present &present) {
+         {
+             std::scoped_lock<std::mutex> cursorLock(presentIdMutex);
+@@ -569,12 +855,15 @@ namespace RT64 {
+ 
+         int processCursor = -1;
+         bool skipPresent = false;
++        bool newerQueued = false;
+         uint32_t displayTimingRate = UINT32_MAX;
+         const bool displayTiming = ext.device->getCapabilities().displayTiming;
+         bool swapChainValid = !ext.swapChain->needsResize();
+         while (presentThreadRunning) {
++            bool waited = false;
+             {
+                 std::unique_lock<std::mutex> cursorLock(cursorMutex);
++                waited = (writeCursor == threadCursor);
+                 cursorCondition.wait(cursorLock, [&]() {
+                     return (writeCursor != threadCursor) || !presentThreadRunning;
+                 });
+@@ -582,7 +871,23 @@ namespace RT64 {
+                 if (presentThreadRunning) {
+                     processCursor = threadCursor;
+                     threadCursor = (threadCursor + 1) % presents.size();
+-                    skipPresent = (writeCursor != threadCursor);
++#               if defined(__EMSCRIPTEN__)
++                    // Decided once this present's workload is done (below).
++                    newerQueued = false;
++#               else
++                    newerQueued = (writeCursor != threadCursor);
++#               endif
++                }
++            }
++
++            // present-stats: a game frame ended at each present the thread came to without waiting for it, unless the one
++            // before was dropped (a second of a burst, reported without the frames).
++            if (presentStats && (processCursor >= 0)) {
++                if (waited) {
++                    resetBusyFrames();
++                }
++                else if (!lastPresentDropped) {
++                    busyFrames++;
+                 }
+             }
+ 
+@@ -624,15 +929,49 @@ namespace RT64 {
+                     }
+                 }
+ 
+-                skipPresent = skipPresent || ext.swapChain->isEmpty();
++                skipPresent = newerQueued || ext.swapChain->isEmpty();
++
++#           if defined(__EMSCRIPTEN__)
++                // A hidden page shows nothing, and in Chrome a present's wait could hold this thread for seconds there
++                // (plume's isHidden()), and the game behind it, whose sound broke up. So it presents nothing until shown.
++                skipPresent = skipPresent || ext.swapChain->isHidden();
++#           endif
+ 
+                 Present &present = presents[processCursor];
+-                ext.workloadQueue->waitForWorkloadId(present.workloadId);
++                {
++                    PhaseTimer phaseTimer(this, PhaseWorkload);
++                    ext.workloadQueue->waitForWorkloadId(present.drawnWorkloadId);
++                }
+ 
+                 if (!presentThreadRunning) {
+                     continue;
+                 }
+ 
++#           if defined(__EMSCRIPTEN__)
++                // A present is dropped for a newer one only if the newer one's workload is done too, so it can be shown in
++                // its place now. Decided when this one was taken from the queue, before its workload, a page whose workloads
++                // end later than the game's next present comes (a phone's CPU, slowed by its heat, at a level's start) found
++                // a newer one queued each time and dropped every present: Banjo-Tooie on a Galaxy S21 went on at 15-20 game
++                // frames a second showing none, for good. Workloads end in order, so the next one is the one to look at.
++                {
++                    const std::scoped_lock cursorLock(cursorMutex);
++                    newerQueued = (writeCursor != threadCursor) && ext.workloadQueue->isWorkloadDone(presents[threadCursor].drawnWorkloadId);
++                }
++
++                skipPresent = skipPresent || newerQueued;
++#           endif
++
++                if (presentStats) {
++                    lastPresentDropped = newerQueued;
++                    if (newerQueued) {
++                        reportDroppedPresent(processCursor, threadCursor);
++                    }
++                }
++
++#           if defined(__EMSCRIPTEN__)
++                pace(skipPresent && !ext.swapChain->isEmpty());
++#           endif
++
+                 if (skipPresent) {
+                     skipInterpolation();
+                     notifyPresentId(present);
+diff --git a/src/hle/rt64_present_queue.h b/src/hle/rt64_present_queue.h
+index 56f7e6d..e34c8db 100644
+--- a/src/hle/rt64_present_queue.h
++++ b/src/hle/rt64_present_queue.h
+@@ -4,7 +4,10 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <deque>
+ #include <functional>
++#include <optional>
+ 
+ #include "common/rt64_profiling_timer.h"
+ #include "gui/rt64_inspector.h"
+@@ -59,6 +62,46 @@ namespace RT64 {
+         Timestamp presentTimestamp;
+         VIHistory viHistory;
+         bool presentWaitEnabled = false;
++        uint32_t pacingMultiple = 0;
++        // pace()'s window: when each present was taken, whether it was dropped, and pacingShown then.
++        struct PacingPresent {
++            Timestamp time;
++            bool dropped;
++            uint64_t shown;
++        };
++
++        std::deque<PacingPresent> pacingPresents;
++        uint32_t pacingDropped = 0;
++        // Frames the present thread has presented, for how many went out in pace()'s window.
++        uint64_t pacingShown = 0;
++        Timestamp pacingChanged;
++        Timestamp pacingRaised;
++        int64_t pacingRetryMicro = 0;
++        uint32_t pacingPrebuildWaits = 0;
++        Timestamp pacingWaited;
++        bool uncapped = false;
++        Timestamp presentSlot;
++
++        // present-stats (?present-stats): when each present was queued, and where the present thread's time went in the
++        // game frames since it last waited for one or dropped one, which it prints at each one it drops (threadLoop()).
++        enum PresentPhase { PhaseWorkload, PhaseInterpolated, PhaseDraw, PhaseSleep, PhaseWait, PhasePresent, PhaseCount };
++        bool presentStats = false;
++        std::array<Timestamp, PRESENT_QUEUE_SIZE> presentQueued;
++        std::array<int64_t, PhaseCount> busyPhaseMicro = {};
++        int64_t busyLateMicro = 0;
++        uint32_t busyFrames = 0;
++        bool lastPresentDropped = false;
++        Timestamp busyStart;
++
++        // Adds the time until the end of its scope to a phase, while present-stats is on.
++        struct PhaseTimer {
++            PresentQueue *queue;
++            PresentPhase phase;
++            Timestamp start;
++
++            PhaseTimer(PresentQueue *queue, PresentPhase phase);
++            ~PhaseTimer();
++        };
+ 
+         // [thps-recomp] Present capture: the final composited image (after upscaling, MSAA resolve or
+         // downsampling, and the VI pass), i.e. what the swap chain shows, copied to the CPU. It is rendered
+@@ -105,6 +148,9 @@ namespace RT64 {
+         void threadPresent(const Present &present, bool &swapChainValid);
+         void threadCapture(RenderTarget *colorTarget, const Present &present, UserConfiguration::Filtering filtering, bool removeBlackBorders, uint64_t presentIndex, bool shownInWindow, bool readback, bool drawUi);
+         void skipInterpolation();
++        void pace(bool presentDropped);
++        void resetBusyFrames();
++        void reportDroppedPresent(int droppedCursor, int nextCursor);
+         void notifyPresentId(const Present &present);
+         void threadAdvanceBarrier();
+         void threadLoop();
+diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
+index cd20efc..720d561 100644
+--- a/src/hle/rt64_rsp.cpp
++++ b/src/hle/rt64_rsp.cpp
+@@ -1128,9 +1128,89 @@ namespace RT64 {
+             maxMatrix = std::max(maxMatrix, worldIndices[globalIndex]);
+         }
+ 
+-        bool visibleTri = true;
++        // The box and the facing test below are read off posScreen, xyz / w with no clipping. A vertex at or behind the
++        // camera plane (w <= 0) doesn't land there: the divide flips it through the centre, so a triangle crossing the
++        // plane got a box anywhere and a winding that was a coin toss, and one a hair in front projected past what
++        // the int32 casts hold. The RSP clips such a triangle and the RDP draws what is left, but here it could be
++        // judged back-facing or its box miss the viewport, and a pass made only of such triangles (a model filling
++        // the bottom of the picture with the camera pitched up at it) had an empty drawColorRect and wasn't drawn in
++        // interpolated frames. A triangle crossing the plane is taken as facing the camera and as covering the scissor,
++        // the bound the RDP draws against. One with every vertex behind it is clipped whole and draws nothing, and one
++        // wholly in front has its box from its vertices held to 8192 pixels each way, past any framebuffer, and its
++        // winding judged only while they are within 4096 (a projective image keeps its winding, but the cross product
++        // of far-out vertices overflows). Taking every such triangle as covering the scissor made a pass whose
++        // triangles were all behind the camera or off one side a write of its whole framebuffer: Banjo-Kazooie's
++        // title made ~100 full-screen tile copies of one within a few seconds, each kept, 3.6 GB at 3840x2000, and
++        // Firefox lost its device to Out of Memory on an 8 GB card. The GPU still clips the triangle as it always did.
++        int behindCount = 0;
++        bool unprojectable = false;
++        bool farOut = false;
++        for (int i = 0; i < 3; i++) {
++            const hlslpp::float4 &t = workload.drawData.posTransformed[globalIndices[i]];
++            const hlslpp::float3 &s = posScreen[globalIndices[i]];
++            if (!(t[3] > 0.0f)) {
++                behindCount++;
++            }
++            else if ((s[0] != s[0]) || (s[1] != s[1])) {
++                unprojectable = true;
++            }
++            else if (!(s[0] * s[0] < 16777216.0f) || !(s[1] * s[1] < 16777216.0f)) {
++                farOut = true;
++            }
++        }
++
++        unprojectable = unprojectable || ((behindCount > 0) && (behindCount < 3));
++        bool visibleTri = (behindCount < 3);
++
++#   if RT64_STRETCH_SCREEN_COVERS
++        // A screen cover is drawn in 3D as a few triangles placed just in front of the camera and sized to cover the 4:3
++        // screen (a plate a scene opens behind, a fade): a call of at most 8 triangles, each wholly in front of the camera
++        // and within the viewport's guard band (its size again past each edge), that between them hold the viewport's
++        // four corners. A scene's own geometry reaches behind the camera or far past the screen, or is more triangles.
++        if (drawCall.triangleCount == 0) {
++            drawCall.coverCorners = 0;
++            drawCall.coverPossible = true;
++        }
++
++        if (drawCall.coverPossible) {
++            auto magnitude = [](float v) { return (v < 0.0f) ? -v : v; };
++            const interop::RSPViewport &coverViewport = viewportStack[viewportStackSize - 1];
++            const float halfWidth = magnitude(float(coverViewport.scale.x));
++            const float halfHeight = magnitude(float(coverViewport.scale.y));
++            const float centerX = float(coverViewport.translate.x);
++            const float centerY = float(coverViewport.translate.y);
++            bool insideGuard = (behindCount == 0) && !unprojectable && (drawCall.triangleCount < 8) && (halfWidth > 0.0f) && (halfHeight > 0.0f);
++            for (int i = 0; (i < 3) && insideGuard; i++) {
++                const hlslpp::float3 &s = posScreen[globalIndices[i]];
++                insideGuard = (magnitude(float(s[0]) - centerX) <= 2.0f * halfWidth) && (magnitude(float(s[1]) - centerY) <= 2.0f * halfHeight);
++            }
++
++            if (insideGuard) {
++                const hlslpp::float3 &p0 = posScreen[globalIndices[0]];
++                const hlslpp::float3 &p1 = posScreen[globalIndices[1]];
++                const hlslpp::float3 &p2 = posScreen[globalIndices[2]];
++                auto edge = [](float ax, float ay, float bx, float by, float px, float py) {
++                    return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
++                };
++
++                for (uint32_t c = 0; c < 4; c++) {
++                    const float px = centerX + (((c & 1) != 0) ? halfWidth : -halfWidth);
++                    const float py = centerY + (((c & 2) != 0) ? halfHeight : -halfHeight);
++                    const float e0 = edge(float(p0[0]), float(p0[1]), float(p1[0]), float(p1[1]), px, py);
++                    const float e1 = edge(float(p1[0]), float(p1[1]), float(p2[0]), float(p2[1]), px, py);
++                    const float e2 = edge(float(p2[0]), float(p2[1]), float(p0[0]), float(p0[1]), px, py);
++                    if (((e0 >= 0.0f) && (e1 >= 0.0f) && (e2 >= 0.0f)) || ((e0 <= 0.0f) && (e1 <= 0.0f) && (e2 <= 0.0f))) {
++                        drawCall.coverCorners |= (1U << c);
++                    }
++                }
++            }
++            else {
++                drawCall.coverPossible = false;
++            }
++        }
++#   endif
+         const bool usesCulling = geometryMode & cullBothMask;
+-        if (usesCulling) {
++        if (usesCulling && visibleTri && !unprojectable && !farOut) {
+             const hlslpp::float3 U = posScreen[globalIndices[1]] - posScreen[globalIndices[0]];
+             const hlslpp::float3 V = posScreen[globalIndices[2]] - posScreen[globalIndices[0]];
+             const hlslpp::float3 N = hlslpp::cross(V, U);
+@@ -1138,26 +1218,26 @@ namespace RT64 {
+         }
+ 
+         const FixedRect &scissorRect = state->rdp->scissorRectStack[state->rdp->scissorStackSize - 1];
+-        if (visibleTri && !scissorRect.isNull()) {
+-            fbPair.scissorRect.merge(scissorRect);
+-
+-            FixedRect drawRect;
+-            // [thps-recomp] A vertex at or behind the camera (w <= 0) projects to the mirrored side of the screen, so the three screen
+-            // positions don't bound the triangle. Take the whole scissor (clipped to the viewport below): the pair's viewport is as tall
+-            // as its drawn area, and a too-short area clipped ground running under the camera (THPS2 School II, frames split in several pairs).
+-            const auto &posTransformed = workload.drawData.posTransformed;
+-            const bool behindCamera = (posTransformed[globalIndices[0]].w <= 0.0f) || (posTransformed[globalIndices[1]].w <= 0.0f) ||
+-                (posTransformed[globalIndices[2]].w <= 0.0f);
+-            if (behindCamera) {
+-                drawRect = scissorRect;
++        if (!scissorRect.isNull()) {
++            const int16_t viewportRatios[4] = { 1, 1, -1, -1 };
++            const FixedRect viewportRect = viewportStack[viewportStackSize - 1].rect(viewportRatios).intersection(scissorRect);
++            if (!viewportRect.isNull()) {
++                fbPair.viewportRect.merge(viewportRect);
+             }
++        }
+ 
+-            for (int i = 0; (i < 3) && !behindCamera; i++) {
+-                const hlslpp::float3 &v = posScreen[globalIndices[i]];
+-                drawRect.ulx = std::min(drawRect.ulx, int32_t(v[0] * 4.0f));
+-                drawRect.uly = std::min(drawRect.uly, int32_t(v[1] * 4.0f));
+-                drawRect.lrx = std::max(drawRect.lrx, int32_t(hlslpp::ceil(v.x).x * 4.0f));
+-                drawRect.lry = std::max(drawRect.lry, int32_t(hlslpp::ceil(v.y).x * 4.0f));
++        if (visibleTri && !scissorRect.isNull()) {
++            fbPair.mergeScissor(scissorRect);
++
++            FixedRect drawRect = unprojectable ? scissorRect : FixedRect();
++            for (int i = 0; (i < 3) && !unprojectable; i++) {
++                const hlslpp::float3 &s = posScreen[globalIndices[i]];
++                const float x = std::min(std::max(float(s[0]), -8192.0f), 8192.0f);
++                const float y = std::min(std::max(float(s[1]), -8192.0f), 8192.0f);
++                drawRect.ulx = std::min(drawRect.ulx, int32_t(x * 4.0f));
++                drawRect.uly = std::min(drawRect.uly, int32_t(y * 4.0f));
++                drawRect.lrx = std::max(drawRect.lrx, int32_t(hlslpp::ceil(hlslpp::float1(x)).x * 4.0f));
++                drawRect.lry = std::max(drawRect.lry, int32_t(hlslpp::ceil(hlslpp::float1(y)).x * 4.0f));
+             }
+ 
+             const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
