@@ -72,6 +72,9 @@
 #include "hfr.h"
 #include "platform.h"
 #include "versions.h"
+#ifdef __EMSCRIPTEN__
+#include "file_picker.h"   // N64Recomp-browser's frontend/: the browser's file picker
+#endif
 #ifdef THPS_MENU
 #include "ui/ui_host.h"
 #endif
@@ -744,6 +747,34 @@ int main(int argc_in, char** argv_in) {
         g_chosen = c.version;
     }
     recomp::check_all_stored_roms();  // is_rom_valid() reads what this finds (also a ROM stored just now)
+#ifdef __EMSCRIPTEN__
+    // A page has no command line: until the browser's storage holds a dump (select_rom keeps it in the config folder,
+    // which the page keeps), the player picks theirs in the browser's file picker, which the page shows as a button.
+    // A file that isn't a dump this build runs is said why and asked for again.
+    if (!g_chosen) {
+        auto stored = [] {
+            for (const thps::VersionInfo& v : thps::all_versions) {
+                if (thps::versions::runnable(v) && recomp::is_rom_valid(game_id_of(v))) return true;
+            }
+            return false;
+        };
+        while (!stored()) {
+            std::printf("[thps] Load ROM: pick your %s dump (.z64, .n64 or .v64)\n", thps::game::family);
+            std::fflush(stdout);
+            std::vector<std::filesystem::path> picked = n64recomp_browser::pick_files(false, ".z64,.n64,.v64");
+            if (picked.empty()) continue;
+            thps::RomCheck c = thps::check_rom_file(picked[0]);
+            auto v = c.version ? recomp::select_rom(picked[0], game_id_of(*c.version)) : recomp::RomValidationError(c.error);
+            std::error_code ec;
+            std::filesystem::remove(picked[0], ec);
+            if (v != recomp::RomValidationError::Good) {
+                std::fprintf(stderr, "[thps] %s\n", c.text.c_str());
+                continue;
+            }
+            recomp::check_all_stored_roms();
+        }
+    }
+#endif
     if (!g_chosen) {
         // The first runnable version (table order) with a stored ROM.
         for (const thps::VersionInfo& v : thps::all_versions) {

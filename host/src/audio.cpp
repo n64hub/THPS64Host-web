@@ -14,6 +14,12 @@
 // the game's pacing (via osAiGetStatus/osAiGetLength -> get_frames_remaining) is the same without
 // sound. --wav PATH also writes everything queued to a 16-bit stereo WAV (ROM-derived: keep it
 // local). THPS_AUDIO_LOG=FILE writes one CSV row per queued buffer (queue depth, underrun counts).
+//
+// On a page (__EMSCRIPTEN__) the sound plays through N64Recomp-browser's n64recomp_browser::audio, an AudioWorklet on
+// the browser's audio thread reading a ring in wasm memory, in place of the SDL device: SDL2's port plays from the
+// page's thread, which WebGPU keeps busy. Each buffer, swapped and at the volume, goes through an SDL_AudioStream from
+// the game's rate to the page's, and the frames still to play are counted back at the game's rate. The page's output
+// has no declick: an underrun there is silence.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -30,6 +36,9 @@
 #include "host.h"
 #include "platform.h"
 #include "thps_hooks.h"
+#ifdef __EMSCRIPTEN__
+#include "audio_output.h"   // N64Recomp-browser's frontend/
+#endif
 
 namespace {
 
@@ -63,6 +72,11 @@ constexpr int kEdgeFrames = 4;    // edge_step looks at the first frames after e
 int g_edge_left = 0;              // frames left to measure after an underrun edge
 
 // The held frame's remaining gain (out of kFadeFrames) and the next step of its fade-out.
+#ifdef __EMSCRIPTEN__
+uint32_t g_web_rate = 0;               // the page's output rate (its audio context's)
+SDL_AudioStream* g_web_stream = nullptr;   // the game's rate, s16, to the page's, float
+#endif
+
 int hold_gain() { return kFadeFrames - std::min(g_fade_out, kFadeFrames); }
 void hold_step() { if (g_fade_out < kFadeFrames) g_fade_out++; }
 
@@ -179,9 +193,20 @@ void virtual_drain() {
     g_virtual_frames = std::max(0.0, g_virtual_frames - played);
 }
 
+#ifdef __EMSCRIPTEN__
+// The frames the page has yet to play and the stream still holds, in the game's frames.
+size_t web_frames_remaining() {
+    const uint64_t page = uint64_t(n64recomp_browser::audio::queued_frames()) +
+        uint64_t(SDL_AudioStreamAvailable(g_web_stream)) / (sizeof(float) * 2);
+    return size_t(page * g_freq / g_web_rate);
+}
+#endif
+
 void open_device_locked(uint32_t freq) {
     if (g_dev) {
+#ifndef __EMSCRIPTEN__
         SDL_CloseAudioDevice(g_dev);
+#endif
         g_dev = 0;
     }
     {
@@ -197,6 +222,19 @@ void open_device_locked(uint32_t freq) {
     g_virtual_frames = 0;
     g_virtual_t = std::chrono::steady_clock::now();
     if (thps::options.mute || !g_sdl_ok) return;
+#ifdef __EMSCRIPTEN__
+    if (g_web_rate == 0) g_web_rate = n64recomp_browser::audio::open(2);
+    if (g_web_stream) SDL_FreeAudioStream(g_web_stream);
+    g_web_stream = SDL_NewAudioStream(AUDIO_S16SYS, 2, int(freq), AUDIO_F32SYS, 2, int(g_web_rate));
+    if (!g_web_stream) {
+        std::fprintf(stderr, "[thps] audio: can't convert %u Hz to the page's %u Hz: %s (muted)\n", freq, g_web_rate, SDL_GetError());
+        return;
+    }
+    g_dev = 1;   // open: the page's output, not an SDL device
+    std::printf("[thps] audio: the page's output at %u Hz, from %u Hz stereo s16\n", g_web_rate, freq);
+    std::fflush(stdout);
+    return;
+#endif
     SDL_AudioSpec want{}, have{};
     want.freq = int(freq);
     want.format = AUDIO_S16SYS;
@@ -218,8 +256,12 @@ void open_device_locked(uint32_t freq) {
 void thps::audio_init() {
     std::lock_guard lock{g_mutex};
     if (!options.mute) {
+#ifdef __EMSCRIPTEN__
+        g_sdl_ok = true;   // the page's output needs no SDL audio (n64recomp_browser::audio)
+#else
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) g_sdl_ok = true;
         else std::fprintf(stderr, "[thps] audio: SDL audio init failed: %s (muted)\n", SDL_GetError());
+#endif
     }
     if (!options.wav_path.empty()) {
         g_wav = platform::fopen_path(options.wav_path, "wb");
@@ -272,6 +314,17 @@ void thps::audio_queue_samples(const int16_t* samples, size_t count) {
     if (peak > stats.audio_peak_ctl.load()) stats.audio_peak_ctl.store(peak);
     auto now = std::chrono::steady_clock::now();
     double before;
+#ifdef __EMSCRIPTEN__
+    if (g_dev && g_web_stream) {
+        before = double(web_frames_remaining());
+        SDL_AudioStreamPut(g_web_stream, g_buf.data(), int(frames * 2 * sizeof(int16_t)));
+        float converted[4096];
+        int got;
+        while ((got = SDL_AudioStreamGet(g_web_stream, converted, sizeof(converted))) > 0) {
+            n64recomp_browser::audio::queue(converted, size_t(got) / (sizeof(float) * 2));
+        }
+    } else
+#endif
     if (g_dev) {
         std::lock_guard rl{g_ring_mutex};
         before = double(g_ring_fill);
@@ -309,6 +362,11 @@ bool thps::audio_device_open() {
 size_t thps::audio_frames_remaining() {
     std::lock_guard lock{g_mutex};
     size_t r;
+#ifdef __EMSCRIPTEN__
+    if (g_dev && g_web_stream) {
+        r = web_frames_remaining();
+    } else
+#endif
     if (g_dev) {
         std::lock_guard rl{g_ring_mutex};
         r = g_ring_fill;

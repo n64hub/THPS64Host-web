@@ -30,6 +30,9 @@
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/config.hpp"
 #include "ultramodern/renderer_context.hpp"
+#ifdef __EMSCRIPTEN__
+#include "ultramodern/displaylists.hpp"
+#endif
 
 #include "host.h"
 #include "draw_distance.h"
@@ -180,6 +183,9 @@ public:
         core.window = window_handle.window;                // HWND
 #elif defined(__linux__)
         core.window = window_handle;                       // SDL_Window* (RT64_SDL_WINDOW_VULKAN)
+#elif defined(__EMSCRIPTEN__)
+        (void)window_handle;
+        core.window = "#canvas";                           // the page's canvas, which SDL's window is
 #elif defined(__APPLE__)
         core.window.window = window_handle.window;
         core.window.view = window_handle.view;
@@ -247,6 +253,11 @@ public:
             return;
         }
         setup_present_capture();
+#ifdef __EMSCRIPTEN__
+        // RT64 marks where it reads each display list's commands from, so a load from ROM can wait for a list it would
+        // land on (N64ModernRuntime-web's displaylists.cpp).
+        app->state->displayListReads = ultramodern::displaylist_reads();
+#endif
         thps::latency_set_app(app.get());
         // RT64 turns MSAA off when the GPU lacks the sample count (Apple GPUs: 2x/4x, no 8x).
         // Quiet terminal (Q19): always shown when MSAA was turned off, otherwise with --verbose.
@@ -319,6 +330,10 @@ public:
         // 120 Hz is not offered: it paced badly on a ProMotion display, 2026-10-23).
         int rate = g.refresh;
         if (const char* t = std::getenv("THPS_TEST_REFRESH")) rate = std::string(t) == "display" ? -1 : std::max(0, std::atoi(t));
+#ifdef __EMSCRIPTEN__
+        // A web page interpolates to the display's rate (N64Recomp-browser's rule for every page): its choice other than Original is Display.
+        else if (rate > 0) rate = -1;
+#endif
         uc.refreshRate = rate < 0 ? RR::Display : rate > 0 ? RR::Manual : RR::Original;
         if (rate > 0) uc.refreshRateTarget = rate;
         // Renderer setup and settings updates can apply the same values again.
@@ -546,6 +561,9 @@ public:
             if (stall_ms > 0 && (n % every) == (uint64_t(every) > 3 ? 3 : 0)) std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
         }
         app->processDisplayLists(app->core.RDRAM, task->t.data_ptr & 0x3FFFFFF, 0, true);
+#ifdef __EMSCRIPTEN__
+        ultramodern::displaylist_read();   // N64ModernRuntime-web: a load from ROM waits for the lists that read where it lands
+#endif
         if (canary) thps::dl_canary_end(app->core.RDRAM, n);
         thps::hfr_task_end(app->state.get());
         note_time(thps::stats.send_dl_us, thps::stats.send_dl_us_max, t0);
@@ -560,6 +578,11 @@ public:
         app->state->rdp->setOtherMode(0x382C30, 0); // G_CYC_FILL etc. (same as recompui)
         app->state->rdp->setFillColor(0);  // black behind the launcher / menus (no game running)
         app->state->rdp->fillRect(0, 0, 320 << 2, 240 << 2);
+#ifdef __EMSCRIPTEN__
+        // Not copied to RDRAM: the dummy framebuffer is game memory once the game starts, and on a page these lists
+        // can fall seconds behind the VIs that queue them, so the copies would land on what the game has loaded there.
+        app->state->setRenderToRAM(0);
+#endif
         app->state->fullSync();
         app->state->listProcessEnd();
     }

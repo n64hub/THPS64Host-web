@@ -718,7 +718,13 @@ void thps::input_init() {
     // describe an Xbox-style layout (A = south), so every pad follows it. Must be set before the subsystem opens a controller.
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#ifdef __EMSCRIPTEN__
+    // Emscripten's SDL2 has no haptic subsystem, and asking for it fails the whole init: rumble goes through
+    // SDL_GameControllerRumble, which the port plays on the Gamepad API.
+    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
+#else
     if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) != 0) {
+#endif
         std::fprintf(stderr, "[thps] input: SDL game controller init failed: %s (keyboard only)\n", SDL_GetError());
     }
 #endif

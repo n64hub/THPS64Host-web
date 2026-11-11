@@ -62,6 +62,28 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 11)
 
+# The page (tools/build_web.py, emcmake): the game in a browser through N64Recomp-browser's web support
+# (-DN64RECOMP_BROWSER_DIR=<its checkout>, a game repository's lib/N64Recomp-browser): RT64 and the menu on WebGPU in the
+# page's canvas, sound on the browser's audio thread, settings, saves and the ROM in the browser's storage. Everything
+# is compiled with threads (pthreads), wasm exceptions, wasm SIMD and tail calls; with -msimd128 xxHash would take its
+# NEON path through Emscripten's arm_neon.h, which doesn't compile in C++.
+if (EMSCRIPTEN)
+    set(N64RECOMP_BROWSER_DIR "" CACHE PATH "An N64Recomp-browser checkout (the page's build)")
+    if (NOT EXISTS "${N64RECOMP_BROWSER_DIR}/frontend/CMakeLists.txt")
+        message(FATAL_ERROR "Set -DN64RECOMP_BROWSER_DIR=<an N64Recomp-browser checkout> (tools/build_web.py does)")
+    endif()
+    add_compile_options(-pthread -fwasm-exceptions -msimd128 -mtail-call "-DXXH_HAS_INCLUDE(x)=0" -sUSE_SDL=2)
+    include_directories(SYSTEM "${EMSCRIPTEN_SYSROOT}/include/SDL2")
+    add_link_options(-pthread -fwasm-exceptions -mtail-call)
+    # ccache when it is on PATH, and paths in the page relative to the checkout; before rt64 and the runtime are added.
+    include("${N64RECOMP_BROWSER_DIR}/frontend/build_speed.cmake")
+    # The shaders the page specializes at build time and builds before the game draws with them (its header says how
+    # it was recorded); before rt64 is added.
+    if (EXISTS "${THPS_GAME_DIR}/web/rt64_shaders.txt")
+        set(RT64_PREBUILT_SHADER_LIST "${THPS_GAME_DIR}/web/rt64_shaders.txt")
+    endif()
+endif()
+
 set(RECOMP_RUNTIME_DIR "" CACHE PATH "Directory holding lib/N64ModernRuntime and lib/rt64")
 if (NOT RECOMP_RUNTIME_DIR)
     message(FATAL_ERROR "Set -DRECOMP_RUNTIME_DIR=<runtime-dir> (tools/setup_runtime.py creates it)")
@@ -204,7 +226,16 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Linux: RT64 takes the SDL_Window itself (SDL_WINDOW_VULKAN) instead of X11 handles, as Zelda64Recomp does.
     set(RT64_SDL_WINDOW_VULKAN ON CACHE BOOL "" FORCE)
 endif()
+if (EMSCRIPTEN)
+    add_subdirectory("${RT64_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/rt64" EXCLUDE_FROM_ALL)
+    add_subdirectory("${N64RECOMP_BROWSER_DIR}/frontend" "${CMAKE_CURRENT_BINARY_DIR}/web_frontend")
+    # fmt 11.1 (N64Recomp's) leans on <cstdlib> arriving through other headers, which Emscripten's libc++ doesn't do.
+    if (TARGET fmt)
+        target_compile_options(fmt PRIVATE -include cstdlib)
+    endif()
+else()
 add_subdirectory("${RT64_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/rt64")
+endif()
 # [release packaging, Q27] Release builds link our own SDL2 (tools/build_sdl2.py, pinned 2.32.10; pass -DCMAKE_PREFIX_PATH=<its prefix>),
 # never Homebrew's: Homebrew's `sdl2` is sdl2-compat, which dlopen()s libSDL3 at run time, and a user's Mac has no Homebrew.
 # tools/package_split.py then copies libSDL2-2.0.0.dylib into the .app and refuses any other non-system dependency.
@@ -228,6 +259,10 @@ if (WIN32)
         set(SDL2_LIBRARIES "${THPS_SDL2_DIR}/lib/x64/SDL2.lib")
         set(THPS_SDL2_DLL "${THPS_SDL2_DIR}/lib/x64/SDL2.dll")
     endif()
+elseif (EMSCRIPTEN)
+    # Emscripten's port of SDL2 (-sUSE_SDL=2, above and in the page's link).
+    set(SDL2_INCLUDE_DIRS "${EMSCRIPTEN_SYSROOT}/include/SDL2")
+    set(SDL2_LIBRARIES "")
 else()
     find_package(SDL2 REQUIRED)
 endif()
@@ -351,6 +386,13 @@ if (THPS_MENU)
     # The shaders are RmlUi's two (Zelda64Recomp's, unchanged); RT64's helpers turn them into SPIR-V / DXIL headers (Metal comes from SPIR-V).
     # (RT64's helpers take the source relative to PROJECT_SOURCE_DIR, the game's recomp-host dir, and the output relative to the build dir.)
     file(RELATIVE_PATH THPS_MENU_SHADERS "${PROJECT_SOURCE_DIR}" "${THPS_SHARED_DIR}/ui/shaders")
+    if (EMSCRIPTEN)
+        # RT64 builds its shaders as WGSL on the web (RT64_WGSL), and so do its helpers here, with what it sets for its
+        # own directory only.
+        set(RT64_WGSL ON)
+        set(RT64_PLUME_WGSL "${RT64_DIR}/src/contrib/plume/examples/cmake/modules/PlumeWGSL.cmake")
+        target_compile_definitions(thps_ui PRIVATE RT64_WGSL=1)
+    endif()
     build_vertex_shader(thps_ui "${THPS_MENU_SHADERS}/InterfaceVS.hlsl" "ui/shaders/InterfaceVS.hlsl")
     build_pixel_shader(thps_ui "${THPS_MENU_SHADERS}/InterfacePS.hlsl" "ui/shaders/InterfacePS.hlsl")
     target_compile_definitions(thps_ui PUBLIC THPS_MENU=1 RMLUI_SDL_VERSION_MAJOR=2 PRIVATE HLSL_CPU __PRFCHWINTRIN_H)
@@ -688,6 +730,7 @@ if (THPS_MENU)
     # <resources>/ui, platform.cpp resource_dir). tools/package_split.py puts the same files into the release package / dev resources.
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     file(GLOB_RECURSE THPS_MENU_FILES CONFIGURE_DEPENDS "${THPS_SHARED_DIR}/ui/menu/*")
+    if (NOT EMSCRIPTEN)
     add_custom_target(thps_menu_assets ALL
         COMMAND "${Python3_EXECUTABLE}" -I "${THPS_SHARED_DIR}/tools/menu_assets.py" "$<TARGET_FILE_DIR:${THPS_EXE}>/resources/ui" "${THPS_MENU_FONTS_SRC}"
         DEPENDS ${THPS_MENU_FILES} "${THPS_SHARED_DIR}/ui/FONTS-LICENSE.txt"
@@ -696,6 +739,7 @@ if (THPS_MENU)
     add_dependencies(thps_menu_assets ${THPS_EXE})
     if (TARGET thps_dev_resources)
         add_dependencies(thps_menu_assets thps_dev_resources)   # it replaces resources/ wholesale (and stages the menu itself): run after it
+    endif()
     endif()
 endif()
 if (THPS_WITH_FRONTEND)
@@ -708,5 +752,27 @@ if (THPS_WITH_FRONTEND)
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${THPS_UI_ASSETS_DIR}" "$<TARGET_FILE_DIR:${THPS_EXE}>/assets")
 endif()
 
+if (EMSCRIPTEN)
+    # The page (lib/N64Recomp-browser/frontend): <exe>.html, .js, .wasm and .data, with coi_serviceworker.js beside it.
+    # The menu's documents, styles and fonts go into its .data at /resources/ui, where resource_dir() finds them; no ROM
+    # data: the player picks their dump on the page (main.cpp), and it stays in the browser's storage.
+    target_link_libraries(${THPS_EXE} PRIVATE n64recomp_browser_file_picker)
+    n64recomp_browser_frontend_page(${THPS_EXE})
+    if (THPS_MENU)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        set(THPS_WEB_RESOURCES "${CMAKE_CURRENT_BINARY_DIR}/web-resources")
+        add_custom_command(OUTPUT "${THPS_WEB_RESOURCES}/ui.stamp"
+            COMMAND "${Python3_EXECUTABLE}" -I "${THPS_SHARED_DIR}/tools/menu_assets.py" "${THPS_WEB_RESOURCES}/ui" "${THPS_MENU_FONTS_SRC}"
+            COMMAND "${CMAKE_COMMAND}" -E touch "${THPS_WEB_RESOURCES}/ui.stamp"
+            DEPENDS ${THPS_MENU_FILES} "${THPS_SHARED_DIR}/ui/FONTS-LICENSE.txt" "${THPS_SHARED_DIR}/tools/menu_assets.py"
+            COMMENT "Staging the in-game menu assets for the page"
+            VERBATIM)
+        add_custom_target(thps_menu_assets_web DEPENDS "${THPS_WEB_RESOURCES}/ui.stamp")
+        add_dependencies(${THPS_EXE} thps_menu_assets_web)
+        target_link_options(${THPS_EXE} PRIVATE "SHELL:--preload-file ${THPS_WEB_RESOURCES}/ui@/resources/ui")
+        set_property(TARGET ${THPS_EXE} APPEND PROPERTY LINK_DEPENDS "${THPS_WEB_RESOURCES}/ui.stamp")
+    endif()
+else()
 # ROM-free unit check of the native ERZ decoder against the user's ROM (prints CRC results only).
 add_executable(erz_selftest ${THPS_SHARED_DIR}/tools/erz_selftest.cpp ${THPS_SHARED_DIR}/src/erz.cpp)
+endif()

@@ -12,9 +12,11 @@ skipped when what it makes is there and its inputs haven't changed:
 
 1. The runtime (work/runtime): tools/setup_runtime.py's pinned N64ModernRuntime and RT64 with this host's patches, as a
    desktop build has them, then N64Recomp-browser's web support over them, project by project (its
-   patches/apply.cmake): RT64 with plume and hlslpp, N64ModernRuntime and its N64Recomp. Made again from nothing
-   whenever N64Recomp-browser's commit, this host's patches or this script's list of what the web leaves out moved,
-   since apply.cmake can't take a checkout from one version of its patches to another (work/runtime.stamp).
+   patches/apply.cmake): RT64 with plume and hlslpp, N64ModernRuntime and its N64Recomp. The files where this host's
+   patches and the web's change the same lines take web/patches/<project>.patch in place of the web's patch, and the
+   web's later changes to them by apply.cmake --since (web/patches/files.txt says which and why). Made again from
+   nothing whenever N64Recomp-browser's commit, this host's patches or web/patches moved, since apply.cmake can't take a
+   checkout from one version of its patches to another (work/runtime.stamp).
 2. N64Recomp and RSPRecomp, built natively from that N64ModernRuntime's N64Recomp: the page needs the code the
    web-patched N64Recomp writes (the desktop build's is its own pin, tools/build_host.py).
 3. The recompiled game and the audio microcode from the dump, as tools/build_host.py makes them (build/gen), redone

@@ -15,6 +15,8 @@
 //   Windows: SetUnhandledExceptionFilter + signal(SIGABRT), frames unwound with RtlLookupFunctionEntry /
 //     RtlVirtualUnwind (the .pdata of the exe, no PDB and no DbgHelp needed). The function start the unwinder
 //     reports is looked up in the same guest table; host frames print module+offset.
+// A web page (Emscripten) installs neither: it has no signals, and a fault is a wasm trap the page reports in its
+// console with the wasm stack, the recompiled functions named.
 #include <algorithm>
 #include <atomic>
 #include <csignal>
@@ -36,7 +38,9 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#ifndef __EMSCRIPTEN__
 #include <execinfo.h>
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -266,7 +270,7 @@ void abort_handler(int sig) {
     windows_report(f, nullptr);
     TerminateProcess(GetCurrentProcess(), 128 + sig);
 }
-#else  // POSIX
+#elif !defined(__EMSCRIPTEN__)  // POSIX
 
 const char* sig_name(int sig) {
     switch (sig) {
@@ -337,6 +341,8 @@ void thps::crash_install(const std::filesystem::path& config_dir) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     std::signal(SIGABRT, abort_handler);
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#elif defined(__EMSCRIPTEN__)
+    (void)log;
 #else
     std::snprintf(g_log_path, sizeof g_log_path, "%s", log.string().c_str());
     struct sigaction sa{};
