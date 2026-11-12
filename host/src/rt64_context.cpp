@@ -230,6 +230,13 @@ public:
         app->userConfig.displayBuffering = RT64::UserConfiguration::DisplayBuffering::Triple;
         app->enhancementConfig.presentation.mode = RT64::EnhancementConfiguration::Presentation::Mode::PresentEarly;
         apply_gfx_config(app->userConfig);
+#ifdef __EMSCRIPTEN__
+        // No render to RAM on a page: THPS2's CPU never reads a frame the RDP drew, nor draws into one (its fades,
+        // overlays and pause backgrounds are display-list commands, and the loader's unpack blocks in the Z buffer wait
+        // for the GPU and read back only what the loader wrote), and on a page each copy is a 5-6 ms wait for the
+        // browser's readback. The desktop keeps it: the host's test tools read finished frames from RDRAM (dump_vi_frame).
+        app->emulatorConfig.framebuffer.renderToRAM = false;
+#endif
 #ifdef THPS_FRONTEND
         // recompui (launcher, settings menu, FPS counter) draws through RT64's render hooks.
         recompui::set_render_hooks();
